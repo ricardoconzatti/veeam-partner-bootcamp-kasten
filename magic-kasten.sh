@@ -6,7 +6,7 @@
 #  Instala, em uma VM Ubuntu 24.04 limpa, um cluster Kubernetes de um nó com
 #  K3s, Longhorn como storage e o Veeam Kasten pronto para uso.
 #
-#  Uso:   sudo bash install-kasten-lab.sh
+#  Uso:   sudo bash magic-kasten.sh
 #
 #  AMBIENTE DE LABORATÓRIO. As escolhas aqui (nó único, uma réplica, interfaces
 #  sem autenticação) existem para simplificar os testes e não devem ser
