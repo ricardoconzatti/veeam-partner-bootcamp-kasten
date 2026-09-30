@@ -52,6 +52,19 @@ KASTEN_PV_SIZE="8Gi"
 KASTEN_PROMETHEUS_SIZE="4Gi"
 KASTEN_EXECUTOR_REPLICAS="1"
 
+# Aplicação de demonstração — sobe um Homer com PostgreSQL e volume persistente,
+# para já haver algo com estado para proteger com o Kasten.
+INSTALL_DEMO_APP="true"                   # "false" não instala
+DEMO_APP_NAME="Homer"
+DEMO_NAMESPACE="homer-demo"
+DEMO_WEB_SERVICE="homer-web"              # serviço que será publicado
+DEMO_NODE_PORT="30080"                    # acesso em http://IP-DA-VM:30080
+DEMO_APP_URL="https://raw.githubusercontent.com/ricardoconzatti/demo/refs/heads/main/homer-demo/Kubernetes/homer-demo-persistent.yaml"
+# O manifesto aponta para as imagens amd64. Em arm64 as mesmas imagens existem
+# no mesmo repositório, com um sufixo na tag (pgsql -> pgsql-arm).
+DEMO_IMAGE_REPO="ricardoconzatti/homer-web"
+DEMO_ARM_TAG_SUFFIX="-arm"
+
 # Repositórios Helm
 LONGHORN_REPO_URL="https://charts.longhorn.io"
 KASTEN_REPO_URL="https://charts.kasten.io/"
@@ -74,8 +87,9 @@ MIN_DISK_GB=40
 readonly KUBECONFIG_PATH="/etc/rancher/k3s/k3s.yaml"
 readonly SNAPSHOTTER_RAW="https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter"
 KUBECTL="k3s kubectl"
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 CURRENT_STEP=0
+DEMO_INSTALLED="false"
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -464,6 +478,80 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+#  10. Aplicação de demonstração
+#      O manifesto cria o namespace, um PostgreSQL com volume persistente e um
+#      front-end web. O PVC não declara storageClassName, então cai na
+#      StorageClass padrão definida na etapa 7 — é o que permite ao Kasten
+#      protegê-lo via snapshot do Longhorn.
+# ------------------------------------------------------------------------------
+install_demo_app() {
+  step "Instalando a aplicação de demonstração ($DEMO_APP_NAME)"
+
+  if [[ "$INSTALL_DEMO_APP" != "true" ]]; then
+    ok "Ignorada (INSTALL_DEMO_APP=\"false\")"
+    return 0
+  fi
+
+  local manifest="/tmp/demo-app.yaml"
+  curl -fsSL "$DEMO_APP_URL" -o "$manifest" \
+    || die "Não foi possível baixar o manifesto da aplicação de demonstração."
+
+  # O manifesto referencia as imagens amd64; em arm64 troca para as tags -arm.
+  if [[ "$(uname -m)" != "x86_64" ]]; then
+    sed -i -E "s|(image:[[:space:]]*${DEMO_IMAGE_REPO}:[A-Za-z0-9._-]+)|\1${DEMO_ARM_TAG_SUFFIX}|g" \
+      "$manifest"
+    ok "Imagens ajustadas para arm64 (sufixo ${DEMO_ARM_TAG_SUFFIX})"
+  fi
+
+  local img
+  for img in $(grep -oE 'image:[[:space:]]*[^[:space:]]+' "$manifest" | awk '{print $2}'); do
+    info "imagem: $img"
+  done
+
+  $KUBECTL apply -f "$manifest" >/dev/null \
+    || die "Falha ao aplicar o manifesto da aplicação de demonstração."
+  ok "Manifesto aplicado no namespace $DEMO_NAMESPACE"
+
+  info "Aguardando os pods ficarem prontos (o PostgreSQL inicializa o banco na primeira subida)..."
+  local d
+  for d in $($KUBECTL -n "$DEMO_NAMESPACE" get deployment -o jsonpath='{.items[*].metadata.name}'); do
+    $KUBECTL -n "$DEMO_NAMESPACE" rollout status "deployment/$d" --timeout=600s >/dev/null \
+      || die "O deployment $d não ficou pronto. Verifique: kubectl get pods -n $DEMO_NAMESPACE"
+    ok "deployment/$d pronto"
+  done
+
+  # Os Services do manifesto são ClusterIP, ou seja, sem acesso externo.
+  # Publica o front-end em uma porta fixa do nó.
+  $KUBECTL -n "$DEMO_NAMESPACE" patch service "$DEMO_WEB_SERVICE" -p \
+    "{\"spec\":{\"type\":\"NodePort\",\"ports\":[{\"name\":\"http\",\"port\":80,\"targetPort\":80,\"protocol\":\"TCP\",\"nodePort\":${DEMO_NODE_PORT}}]}}" \
+    >/dev/null \
+    || die "Não foi possível publicar o serviço $DEMO_WEB_SERVICE na porta $DEMO_NODE_PORT."
+  ok "Serviço $DEMO_WEB_SERVICE publicado na porta $DEMO_NODE_PORT"
+
+  local pvc sc
+  pvc="$($KUBECTL -n "$DEMO_NAMESPACE" get pvc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -n "$pvc" ]]; then
+    sc="$($KUBECTL -n "$DEMO_NAMESPACE" get pvc "$pvc" -o jsonpath='{.spec.storageClassName}')"
+    ok "Volume persistente $pvc na StorageClass $sc"
+  fi
+
+  local i code
+  for i in $(seq 1 24); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            "http://127.0.0.1:${DEMO_NODE_PORT}/" || true)"
+    [[ "$code" =~ ^(200|301|302)$ ]] && break
+    sleep 5
+  done
+  if [[ "$code" =~ ^(200|301|302)$ ]]; then
+    ok "$DEMO_APP_NAME respondendo (HTTP $code)"
+    DEMO_INSTALLED="true"
+  else
+    warn "$DEMO_APP_NAME ainda não respondeu (HTTP ${code:-sem resposta}). Verifique: kubectl get pods -n $DEMO_NAMESPACE"
+    DEMO_INSTALLED="true"
+  fi
+}
+
+# ------------------------------------------------------------------------------
 #  Resumo final
 # ------------------------------------------------------------------------------
 summary() {
@@ -475,8 +563,12 @@ summary() {
   printf '  Ambiente pronto\n'
   printf '==============================================================================%s\n' "$C_RESET"
   printf '\n'
-  printf '  %sVeeam Kasten%s   %s/%s/#/\n' "$C_BOLD" "$C_RESET" "$base" "$KASTEN_URL_PATH"
-  printf '  %sLonghorn%s       %s/\n' "$C_BOLD" "$C_RESET" "$base"
+  # O nome vai em argumento separado para o %-14s alinhar sem contar as cores
+  printf '  %s%-14s%s %s/%s/#/\n' "$C_BOLD" "Veeam Kasten" "$C_RESET" "$base" "$KASTEN_URL_PATH"
+  printf '  %s%-14s%s %s/\n'      "$C_BOLD" "Longhorn"     "$C_RESET" "$base"
+  if [[ "$DEMO_INSTALLED" == "true" ]]; then
+    printf '  %s%-14s%s http://%s:%s\n' "$C_BOLD" "$DEMO_APP_NAME" "$C_RESET" "$NODE_IP" "$DEMO_NODE_PORT"
+  fi
   printf '\n'
   printf '  %sVersões%s\n' "$C_BOLD" "$C_RESET"
   printf '    K3s %s · Longhorn %s · external-snapshotter %s · Kasten %s\n' \
@@ -486,7 +578,12 @@ summary() {
   printf '    1. Abra a interface do Kasten pelo navegador da sua estação.\n'
   printf '    2. Informe e-mail e empresa e aceite os termos.\n'
   printf '    3. Em Settings > System Information, valide a StorageClass %s.\n' "$STORAGE_CLASS"
-  printf '    4. Em Applications, crie uma política de snapshot para testar.\n'
+  if [[ "$DEMO_INSTALLED" == "true" ]]; then
+    printf '    4. Em Applications, o namespace %s aparece como Unmanaged.\n' "$DEMO_NAMESPACE"
+    printf '       Clique nos três pontos > Create a Policy para protegê-lo.\n'
+  else
+    printf '    4. Em Applications, crie uma política de snapshot para testar.\n'
+  fi
   printf '\n'
   if [[ -n "$INGRESS_HOST" ]]; then
     printf '  %sDNS%s  adicione ao /etc/hosts da sua estação (não da VM):\n' "$C_BOLD" "$C_RESET"
@@ -526,6 +623,7 @@ main() {
   configure_storage
   install_kasten
   configure_ingress
+  install_demo_app
   summary
 
   printf '%s  Concluído em %d minutos.%s\n\n' \
