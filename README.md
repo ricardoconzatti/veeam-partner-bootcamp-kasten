@@ -26,7 +26,7 @@ O tutorial completo de instalação e configuração do Kubernetes single-node c
 
 ## Instalação automática
 
-Se quiser simplesmente o ambiente pronto, em uma VM Ubuntu Server 24.04 limpa com o mínimo de 2 vCPU, 6 GB memória RAM e 80 GB disco:
+Se quiser simplesmente o ambiente pronto, execute o comando abaixo em uma VM Ubuntu Server 24.04 limpa com [endereço IP fixo](https://ubuntu.com/server/docs/explanation/networking/configuring-networks/) e no mínimo 2 vCPU, 6 GB memória RAM e 80 GB disco:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/ricardoconzatti/veeam-partner-bootcamp-kasten/main/magic-kasten.sh
